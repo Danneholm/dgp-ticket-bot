@@ -1,0 +1,64 @@
+name: Check Dutch GP Tickets
+
+on:
+  schedule:
+    # Runs automatically every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-tickets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install Requests
+        run: pip install requests
+
+      - name: Run Script
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "
+          import os, requests
+
+          API_URL = 'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/12c424fe-b4e6-48e3-a710-5c1785eea8f5/section/simple?language=NL'
+          SHOP_URL = 'https://shop.ticketing.cm.com/dgpresell/resell/subscription/01612d62-d8f4-4f04-a706-44c5ec27fc96'
+
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          chat_id = os.environ['TELEGRAM_CHAT_ID']
+
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Accept': 'application/json, text/plain, */*',
+              'Origin': 'https://shop.ticketing.cm.com',
+              'Referer': 'https://shop.ticketing.cm.com/'
+          }
+
+          try:
+              res = requests.get(API_URL, headers=headers, timeout=10)
+              if res.status_code == 200:
+                  data = res.json()
+                  ga_keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2']
+                  sections = data if isinstance(data, list) else data.get('sections', data.get('data', []))
+                  
+                  for item in sections:
+                      name = str(item.get('name', '')).lower()
+                      if any(kw in name for kw in ga_keywords):
+                          count = item.get('availableCount', item.get('count', item.get('availableTickets', 0)))
+                          is_avail = item.get('available', item.get('isAvailable', False))
+                          
+                          if count > 0 or is_avail is True:
+                              msg = f'🏎️ 🎟️ <b>GENERAL ADMISSION TICKETS AVAILABLE!</b>\n\n<b>Section:</b> {item.get(\"name\")}\n<b>Buy Now:</b> {SHOP_URL}'
+                              requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
+                              print('MATCH DETECTED! Telegram alert sent.')
+                              break
+                  else:
+                      print('Checked: 0 GA tickets currently listed.')
+          except Exception as e:
+              print(f'Error checking API: {e}')
+          "
