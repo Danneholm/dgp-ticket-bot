@@ -2,6 +2,8 @@ name: Check Dutch GP Tickets
 
 
 on:
+  push:
+    branches: [ main ]
   schedule:
     # Runs automatically every 5 minutes
     - cron: '*/15 * * * *'
