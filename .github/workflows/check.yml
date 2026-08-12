@@ -6,7 +6,7 @@ on:
     branches: [ main ]
   schedule:
     # Runs automatically every 5 minutes
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
