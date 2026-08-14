@@ -16,8 +16,10 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install Dependencies
-        run: pip install requests beautifulsoup4
+      - name: Install Playwright & Requests
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
 
       - name: Run Ticket Checker
         env:
@@ -26,111 +28,92 @@ jobs:
         run: |
           cat << 'EOF' > check.py
           import os
-          import re
           import json
           import requests
-          from bs4 import BeautifulSoup
-          from urllib.parse import urljoin
+          from playwright.sync_api import sync_playwright
 
-          SUB_ID = "01612d62-d8f4-4f04-a706-44c5ec27fc96"
-          VENUE_ID = "12c424fe-b4e6-48e3-a710-5c1785eea8f5"
-          SHOP_URL = f"https://shop.ticketing.cm.com/dgpresell/resell/subscription/{SUB_ID}"
-
+          SHOP_URL = "https://shop.ticketing.cm.com/dgpresell/resell/subscription/01612d62-d8f4-4f04-a706-44c5ec27fc96"
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-          headers = {
-              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-              "Accept": "application/json, text/plain, */*",
-              "Referer": SHOP_URL,
-              "Origin": "https://shop.ticketing.cm.com"
-          }
-
-          candidate_urls = [
-              f"https://api.ticketing.cm.com/resell/v1.0/channels/dgpresell/subscriptions/{SUB_ID}",
-              f"https://api.ticketing.cm.com/resell/v1.0/channels/dgpresell/subscriptions/{SUB_ID}/offers",
-              f"https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}",
-              f"https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}/offers",
-              f"https://api.ticketing.cm.com/resell/v1.0/dgpresell/subscription/{SUB_ID}",
-              f"https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/offers",
-              f"https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/{SUB_ID}"
-          ]
-
-          print("🔍 Scanning web app bundle for live backend endpoints...")
-          try:
-              resp = requests.get(SHOP_URL, headers=headers, timeout=10)
-              if resp.status_code == 200:
-                  soup = BeautifulSoup(resp.text, "html.parser")
-                  for script in soup.find_all("script", src=True):
-                      src = script["src"]
-                      if not src.endswith(".js"):
-                          continue
-                      js_url = urljoin(SHOP_URL, src)
-                      js_res = requests.get(js_url, headers=headers, timeout=10)
-                      if js_res.status_code == 200:
-                          # Extract full api URLs and relative paths
-                          found_paths = re.findall(r'["\'](/(?:resell|seatedapi|api)/v[0-9.]*/[^"\']+)["\']', js_res.text)
-                          for path in found_paths:
-                              formatted = (
-                                  f"https://api.ticketing.cm.com{path}"
-                                  .replace("{subscriptionId}", SUB_ID)
-                                  .replace("{subscription_id}", SUB_ID)
-                                  .replace("{id}", SUB_ID)
-                                  .replace("{channel}", "dgpresell")
-                                  .replace("{venueId}", VENUE_ID)
-                              )
-                              if formatted not in candidate_urls:
-                                  candidate_urls.append(formatted)
-          except Exception as e:
-              print(f"Bundle scan note: {e}")
-
-          print(f"🎯 Probing {len(candidate_urls)} possible endpoints...\n")
-
           keywords = [
-              "general admission", "staanplaats", "staanplaatsen", 
-              "ga 1", "ga 2", "grandstand", "vrijdag", "friday", 
+              "general admission", "staanplaats", "staanplaatsen",
+              "ga 1", "ga 2", "grandstand", "vrijdag", "friday",
               "tribune", "tarzan", "arena", "eastside", "pit"
           ]
 
-          found_api = False
+          print(f"🚀 Launching headless browser to inspect: {SHOP_URL}")
 
-          for url in candidate_urls:
+          captured_apis = []
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(
+                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+              )
+              page = context.new_page()
+
+              # Intercept all internal XHR/Fetch API calls the shop makes
+              def on_response(response):
+                  req = response.request
+                  if req.resource_type in ["xhr", "fetch"]:
+                      try:
+                          text = response.text()
+                          print(f"\n📡 [NETWORK XHR] {response.status} {response.url}")
+                          print(f"Payload Preview: {text[:350]}")
+                          captured_apis.append((response.url, text))
+                      except Exception:
+                          pass
+
+              page.on("response", on_response)
+
               try:
-                  res = requests.get(url, headers=headers, timeout=5)
-                  content_type = res.headers.get("Content-Type", "")
+                  page.goto(SHOP_URL, wait_until="networkidle", timeout=30000)
+              except Exception as e:
+                  print(f"Page load notice: {e}")
 
-                  # Must be HTTP 200 and JSON
-                  if res.status_code == 200 and "application/json" in content_type:
-                      data = res.json()
-                      found_api = True
-                      print(f"✅ WORKING API FOUND: {url}")
-                      print(f"Sample Data:\n{json.dumps(data, indent=2)[:1000]}\n")
+              # Brief pause for dynamic Angular rendering
+              page.wait_for_timeout(3000)
 
-                      data_str = json.dumps(data).lower()
-                      matched = [k for k in keywords if k in data_str]
+              # 1. Inspect rendered DOM text
+              page_text = page.inner_text("body").lower()
+              print(f"\n📄 RENDERED PAGE PREVIEW:\n{page_text[:400]}\n")
 
-                      if matched:
-                          print(f"⚡ MATCH FOUND FOR: {matched}")
-                          msg = (
-                              f"🏎️ 🎟️ <b>DUTCH GP RESALE TICKETS AVAILABLE!</b>\n\n"
-                              f"<b>Matched Categories:</b> {', '.join(matched)}\n\n"
-                              f"<b>Buy Now:</b> {SHOP_URL}"
-                          )
-                          requests.post(
-                              f"https://api.telegram.org/bot{token}/sendMessage",
-                              json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
-                          )
-                          print("Telegram alert sent!")
-                      else:
-                          print("Status: Endpoint checked, but no matching tickets in stock right now.")
-                      break
-                  else:
-                      print(f"Probe: {url} -> Status {res.status_code}")
-              except Exception as err:
-                  continue
+              matched_in_page = [kw for kw in keywords if kw in page_text]
 
-          if not found_api:
-              print("\nNo direct JSON endpoint returned 200 OK during this run.")
+              # 2. Inspect captured API payloads
+              matched_in_api = []
+              for url, payload in captured_apis:
+                  p_lower = payload.lower()
+                  # Exclude static venue layout endpoints
+                  if "seatedapi" not in url:
+                      for kw in keywords:
+                          if kw in p_lower and kw not in matched_in_api:
+                              matched_in_api.append(kw)
+
+              matches = list(set(matched_in_page + matched_in_api))
+              print(f"🔎 Keyword matches found: {matches}")
+
+              # Verify against purchase / ticket indicators
+              has_ticket_indicators = any(ind in page_text for ind in ["ticket", "kaart", "€", "available", "beschikbaar", "bestel", "selecteer"])
+
+              if matches and has_ticket_indicators:
+                  print(f"⚡ TICKETS DETECTED! Alerting Telegram for: {matches}")
+                  msg = (
+                      f"🏎️ 🎟️ <b>DUTCH GP RESALE TICKETS AVAILABLE!</b>\n\n"
+                      f"<b>Matched Categories:</b> {', '.join(matches)}\n\n"
+                      f"<b>Buy Now:</b> {SHOP_URL}"
+                  )
+                  if token and chat_id:
+                      res = requests.post(
+                          f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
+                      )
+                      print(f"Telegram response: {res.status_code}")
+              else:
+                  print("✅ Check complete: No active resale inventory currently matching.")
+
+              browser.close()
           EOF
 
           python check.py
