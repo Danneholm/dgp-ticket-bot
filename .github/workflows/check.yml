@@ -16,93 +16,121 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install Requests
-        run: pip install requests
+      - name: Install Dependencies
+        run: pip install requests beautifulsoup4
 
-      - name: Run Script
+      - name: Run Ticket Checker
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -c "
-          import os, re, json, requests
+          cat << 'EOF' > check.py
+          import os
+          import re
+          import json
+          import requests
+          from bs4 import BeautifulSoup
           from urllib.parse import urljoin
 
-          SUB_ID = '01612d62-d8f4-4f04-a706-44c5ec27fc96'
-          VENUE_ID = '12c424fe-b4e6-48e3-a710-5c1785eea8f5'
-          SHOP_URL = f'https://shop.ticketing.cm.com/dgpresell/resell/subscription/{SUB_ID}'
+          SUB_ID = "01612d62-d8f4-4f04-a706-44c5ec27fc96"
+          VENUE_ID = "12c424fe-b4e6-48e3-a710-5c1785eea8f5"
+          SHOP_URL = f"https://shop.ticketing.cm.com/dgpresell/resell/subscription/{SUB_ID}"
 
-          token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-          chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-          req_headers = {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-              'Accept': 'application/json, text/plain, */*',
-              'Referer': SHOP_URL,
-              'Origin': 'https://shop.ticketing.cm.com'
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+              "Accept": "application/json, text/plain, */*",
+              "Referer": SHOP_URL,
+              "Origin": "https://shop.ticketing.cm.com"
           }
 
-          # 1. Probe known tenant/channel paths
           candidate_urls = [
-              f'https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}',
-              f'https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}/offers',
-              f'https://api.ticketing.cm.com/resell/v1.0/channel/dgpresell/subscription/{SUB_ID}',
-              f'https://api.ticketing.cm.com/resell/v1.0/public/event/{SUB_ID}',
-              f'https://api.ticketing.cm.com/resell/v1.0/dgpresell/subscription/{SUB_ID}',
-              f'https://api.ticketing.cm.com/resell/v1.0/public/channel/dgpresell/offers',
-              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/offers'
+              f"https://api.ticketing.cm.com/resell/v1.0/channels/dgpresell/subscriptions/{SUB_ID}",
+              f"https://api.ticketing.cm.com/resell/v1.0/channels/dgpresell/subscriptions/{SUB_ID}/offers",
+              f"https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}",
+              f"https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}/offers",
+              f"https://api.ticketing.cm.com/resell/v1.0/dgpresell/subscription/{SUB_ID}",
+              f"https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/offers",
+              f"https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/{SUB_ID}"
           ]
 
-          # 2. Inspect frontend scripts from the shop page
-          print('--> Scanning frontend app bundle for live API routes...')
+          print("🔍 Scanning web app bundle for live backend endpoints...")
           try:
-              html_res = requests.get(SHOP_URL, headers=req_headers, timeout=10)
-              scripts = re.findall(r'<script[^>]+src=[\"\\\']([^\"\\\']+\.js)[\"\\\']', html_res.text)
-              for s in scripts:
-                  js_url = urljoin(SHOP_URL, s)
-                  js_res = requests.get(js_url, headers=req_headers, timeout=10)
-                  # Find all API routes in the JS source
-                  endpoints = re.findall(r'[\"\\\'](/(?:resell|seatedapi|shop|subscription)/v[0-9.]*/[^\"\\\']+)[\"\\\']', js_res.text)
-                  for ep in endpoints:
-                      full_ep = f'https://api.ticketing.cm.com{ep}'.replace('{subscriptionId}', SUB_ID).replace('{id}', SUB_ID).replace('{channel}', 'dgpresell').replace('{venueId}', VENUE_ID)
-                      if full_ep not in candidate_urls:
-                          candidate_urls.append(full_ep)
-          except Exception as scan_err:
-              print(f'Frontend scan note: {scan_err}')
+              resp = requests.get(SHOP_URL, headers=headers, timeout=10)
+              if resp.status_code == 200:
+                  soup = BeautifulSoup(resp.text, "html.parser")
+                  for script in soup.find_all("script", src=True):
+                      src = script["src"]
+                      if not src.endswith(".js"):
+                          continue
+                      js_url = urljoin(SHOP_URL, src)
+                      js_res = requests.get(js_url, headers=headers, timeout=10)
+                      if js_res.status_code == 200:
+                          # Extract full api URLs and relative paths
+                          found_paths = re.findall(r'["\'](/(?:resell|seatedapi|api)/v[0-9.]*/[^"\']+)["\']', js_res.text)
+                          for path in found_paths:
+                              formatted = (
+                                  f"https://api.ticketing.cm.com{path}"
+                                  .replace("{subscriptionId}", SUB_ID)
+                                  .replace("{subscription_id}", SUB_ID)
+                                  .replace("{id}", SUB_ID)
+                                  .replace("{channel}", "dgpresell")
+                                  .replace("{venueId}", VENUE_ID)
+                              )
+                              if formatted not in candidate_urls:
+                                  candidate_urls.append(formatted)
+          except Exception as e:
+              print(f"Bundle scan note: {e}")
 
-          print(f'--> Discovered {len(candidate_urls)} target endpoints to test.\n')
+          print(f"🎯 Probing {len(candidate_urls)} possible endpoints...\n")
 
-          keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2', 'grandstand', 'vrijdag', 'friday', 'tribune', 'tarzan', 'arena', 'eastside', 'pit']
-          found_live_api = False
+          keywords = [
+              "general admission", "staanplaats", "staanplaatsen", 
+              "ga 1", "ga 2", "grandstand", "vrijdag", "friday", 
+              "tribune", "tarzan", "arena", "eastside", "pit"
+          ]
+
+          found_api = False
 
           for url in candidate_urls:
               try:
-                  res = requests.get(url, headers=req_headers, timeout=5)
-                  content_type = res.headers.get('Content-Type', '')
-                  
-                  # Must be 200 OK and valid JSON (not HTML fallback)
-                  if res.status_code == 200 and 'application/json' in content_type:
+                  res = requests.get(url, headers=headers, timeout=5)
+                  content_type = res.headers.get("Content-Type", "")
+
+                  # Must be HTTP 200 and JSON
+                  if res.status_code == 200 and "application/json" in content_type:
                       data = res.json()
-                      found_live_api = True
-                      print(f'🎯 ACTIVE JSON ENDPOINT: {url}\n')
-                      print(f'DATA SAMPLE: {json.dumps(data, indent=2)[:800]}\n')
+                      found_api = True
+                      print(f"✅ WORKING API FOUND: {url}")
+                      print(f"Sample Data:\n{json.dumps(data, indent=2)[:1000]}\n")
 
                       data_str = json.dumps(data).lower()
                       matched = [k for k in keywords if k in data_str]
 
                       if matched:
-                          print(f'⚡ TICKET INVENTORY FOUND! Matched: {matched}')
-                          msg = f'🏎️ 🎟️ <b>DUTCH GP RESALE TICKETS AVAILABLE!</b>\n\n<b>Categories:</b> {matched}\n\n<b>Buy Now:</b> {SHOP_URL}'
-                          requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
-                          print('Telegram alert successfully sent!')
+                          print(f"⚡ MATCH FOUND FOR: {matched}")
+                          msg = (
+                              f"🏎️ 🎟️ <b>DUTCH GP RESALE TICKETS AVAILABLE!</b>\n\n"
+                              f"<b>Matched Categories:</b> {', '.join(matched)}\n\n"
+                              f"<b>Buy Now:</b> {SHOP_URL}"
+                          )
+                          requests.post(
+                              f"https://api.telegram.org/bot{token}/sendMessage",
+                              json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
+                          )
+                          print("Telegram alert sent!")
                       else:
-                          print('Checked: Store currently has 0 inventory for target tickets.')
+                          print("Status: Endpoint checked, but no matching tickets in stock right now.")
                       break
                   else:
-                      print(f'Skipping: {url} (Status {res.status_code}, Type: {content_type.split(\";\")[0]})')
-              except Exception as e:
+                      print(f"Probe: {url} -> Status {res.status_code}")
+              except Exception as err:
                   continue
 
-          if not found_live_api:
-              print('Finished scan cycle: No open inventory or endpoint mismatch.')
-          "
+          if not found_api:
+              print("\nNo direct JSON endpoint returned 200 OK during this run.")
+          EOF
+
+          python check.py
