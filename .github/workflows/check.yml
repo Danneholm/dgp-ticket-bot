@@ -27,49 +27,67 @@ jobs:
           python -c "
           import os, requests, json
 
-          SUBSCRIPTION_ID = '01612d62-d8f4-4f04-a706-44c5ec27fc96'
-          API_URL = f'https://api.ticketing.cm.com/resell/v1.0/public/subscription/{SUBSCRIPTION_ID}'
-          SHOP_URL = f'https://shop.ticketing.cm.com/dgpresell/resell/subscription/{SUBSCRIPTION_ID}'
+          SUB_ID = '01612d62-d8f4-4f04-a706-44c5ec27fc96'
+          VENUE_ID = '12c424fe-b4e6-48e3-a710-5c1785eea8f5'
+          SHOP_URL = f'https://shop.ticketing.cm.com/dgpresell/resell/subscription/{SUB_ID}'
 
           token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
           chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
 
           headers = {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
               'Accept': 'application/json, text/plain, */*',
               'Origin': 'https://shop.ticketing.cm.com',
-              'Referer': f'{SHOP_URL}'
+              'Referer': SHOP_URL
           }
 
-          try:
-              res = requests.get(API_URL, headers=headers, timeout=10)
-              print(f'=== HTTP STATUS: {res.status_code} ===')
+          endpoints_to_probe = [
+              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}/offers',
+              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}',
+              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}/items',
+              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}/availability',
+              f'https://api.ticketing.cm.com/resell/v1.0/public/subscription/{SUB_ID}/offers',
+              f'https://api.ticketing.cm.com/resell/v1.0/offers?subscriptionId={SUB_ID}',
+              f'https://api.ticketing.cm.com/resellapi/v1.0/subscription/{SUB_ID}/offers',
+              f'https://api.ticketing.cm.com/resellapi/v1.0/public/subscription/{SUB_ID}',
+              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/subscription/{SUB_ID}',
+              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/subscription/{SUB_ID}/availability',
+              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/event/subscription/{SUB_ID}/availability',
+              f'https://shop.ticketing.cm.com/api/resell/subscription/{SUB_ID}'
+          ]
 
-              if res.status_code == 200:
-                  data = res.json()
-                  # Extract items/offers list from the resell response
-                  items = data if isinstance(data, list) else data.get('items', data.get('offers', data.get('products', [data])))
-                  print(f'=== RAW RESELL DATA ===\n{json.dumps(data, indent=2)}\n')
+          keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2', 'grandstand', 'vrijdag', 'friday', 'tribune', 'tarzan', 'arena', 'eastside', 'pit']
 
-                  # Keywords to match (all lowercase)
-                  keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2', 'grandstand', 'vrijdag', 'friday', 'tribune']
+          found_working_api = False
+
+          for url in endpoints_to_probe:
+              try:
+                  res = requests.get(url, headers=headers, timeout=5)
+                  print(f'Testing: {url} --> Status: {res.status_code}')
                   
-                  matches = []
-                  for item in items:
-                      # Search all text inside each item object for keywords
-                      item_str = json.dumps(item).lower()
-                      if any(kw in item_str for kw in keywords):
-                          name = item.get('name', item.get('title', item.get('description', 'Ticket Match Found')))
-                          matches.append(name)
+                  if res.status_code == 200:
+                      found_working_api = True
+                      print(f'\n🎯 SUCCESSFUL ENDPOINT FOUND:\n{url}\n')
+                      try:
+                          data = res.json()
+                          print('RESPONSE DATA SAMPLE:')
+                          print(json.dumps(data, indent=2)[:1500])
+                          
+                          # Search response for ticket matches
+                          data_str = json.dumps(data).lower()
+                          matched_kws = [kw for kw in keywords if kw in data_str]
+                          
+                          if matched_kws:
+                              print(f'\n⚡ MATCH FOUND FOR KEYWORDS: {matched_kws}')
+                              msg = f'🏎️ 🎟️ <b>DUTCH GP TICKETS DETECTED!</b>\n\n<b>Keywords matched:</b> {matched_kws}\n\n<b>Buy Now:</b> {SHOP_URL}'
+                              requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
+                              print('Telegram alert sent successfully!')
+                      except Exception as parse_err:
+                          print(f'Could not parse JSON: {parse_err}')
+                      break
+              except Exception as e:
+                  print(f'Failed connecting to {url}: {e}')
 
-                  if matches:
-                      msg = f'🏎️ 🎟️ <b>DUTCH GP TICKETS AVAILABLE!</b>\n\n<b>Found:</b> {len(matches)} matching ticket(s)\n<b>Details:</b> {matches[0]}\n\n<b>Buy Now:</b> {SHOP_URL}'
-                      requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
-                      print(f'MATCH DETECTED! Sent Telegram alert for: {matches}')
-                  else:
-                      print('Checked: 0 matching tickets available right now.')
-              else:
-                  print(f'API returned non-200 status: {res.status_code} -> {res.text}')
-          except Exception as e:
-              print(f'Error occurred: {e}')
+          if not found_working_api:
+              print('\nNone of the direct endpoints returned 200 OK.')
           "
