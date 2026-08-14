@@ -46,7 +46,7 @@ jobs:
               res = requests.get(API_URL, headers=headers, timeout=10)
               if res.status_code == 200:
                   data = res.json()
-                  ga_keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2', 'Grandstand']
+                  ga_keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2', 'grandstand', 'friday']
                   sections = data if isinstance(data, list) else data.get('sections', data.get('data', []))
                   
                   for item in sections:
