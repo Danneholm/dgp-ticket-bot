@@ -27,8 +27,9 @@ jobs:
           python -c "
           import os, requests, json
 
-          API_URL = 'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/12c424fe-b4e6-48e3-a710-5c1785eea8f5/section/simple?language=NL'
-          SHOP_URL = 'https://shop.ticketing.cm.com/dgpresell/resell/subscription/01612d62-d8f4-4f04-a706-44c5ec27fc96'
+          SUBSCRIPTION_ID = '01612d62-d8f4-4f04-a706-44c5ec27fc96'
+          API_URL = f'https://api.ticketing.cm.com/resell/v1.0/public/subscription/{SUBSCRIPTION_ID}'
+          SHOP_URL = f'https://shop.ticketing.cm.com/dgpresell/resell/subscription/{SUBSCRIPTION_ID}'
 
           token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
           chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -37,22 +38,38 @@ jobs:
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
               'Accept': 'application/json, text/plain, */*',
               'Origin': 'https://shop.ticketing.cm.com',
-              'Referer': 'https://shop.ticketing.cm.com/'
+              'Referer': f'{SHOP_URL}'
           }
 
           try:
               res = requests.get(API_URL, headers=headers, timeout=10)
               print(f'=== HTTP STATUS: {res.status_code} ===')
+
               if res.status_code == 200:
                   data = res.json()
-                  sections = data if isinstance(data, list) else data.get('sections', data.get('data', []))
-                  print(f'=== TOTAL SECTIONS RETURNED: {len(sections)} ===\n')
+                  # Extract items/offers list from the resell response
+                  items = data if isinstance(data, list) else data.get('items', data.get('offers', data.get('products', [data])))
+                  print(f'=== RAW RESELL DATA ===\n{json.dumps(data, indent=2)}\n')
 
-                  for item in sections:
-                      name = item.get('name', 'Unknown Name')
-                      print(f'SECTION: {name} | RAW DATA: {item}')
+                  # Keywords to match (all lowercase)
+                  keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2', 'grandstand', 'vrijdag', 'friday', 'tribune']
+                  
+                  matches = []
+                  for item in items:
+                      # Search all text inside each item object for keywords
+                      item_str = json.dumps(item).lower()
+                      if any(kw in item_str for kw in keywords):
+                          name = item.get('name', item.get('title', item.get('description', 'Ticket Match Found')))
+                          matches.append(name)
+
+                  if matches:
+                      msg = f'🏎️ 🎟️ <b>DUTCH GP TICKETS AVAILABLE!</b>\n\n<b>Found:</b> {len(matches)} matching ticket(s)\n<b>Details:</b> {matches[0]}\n\n<b>Buy Now:</b> {SHOP_URL}'
+                      requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
+                      print(f'MATCH DETECTED! Sent Telegram alert for: {matches}')
+                  else:
+                      print('Checked: 0 matching tickets available right now.')
               else:
-                  print(f'Response Body: {res.text}')
+                  print(f'API returned non-200 status: {res.status_code} -> {res.text}')
           except Exception as e:
               print(f'Error occurred: {e}')
           "
