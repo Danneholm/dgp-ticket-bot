@@ -25,7 +25,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -c "
-          import os, requests, json
+          import os, re, json, requests
+          from urllib.parse import urljoin
 
           SUB_ID = '01612d62-d8f4-4f04-a706-44c5ec27fc96'
           VENUE_ID = '12c424fe-b4e6-48e3-a710-5c1785eea8f5'
@@ -34,60 +35,74 @@ jobs:
           token = os.environ.get('TELEGRAM_BOT_TOKEN', '')
           chat_id = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-          headers = {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          req_headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
               'Accept': 'application/json, text/plain, */*',
-              'Origin': 'https://shop.ticketing.cm.com',
-              'Referer': SHOP_URL
+              'Referer': SHOP_URL,
+              'Origin': 'https://shop.ticketing.cm.com'
           }
 
-          endpoints_to_probe = [
-              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}/offers',
-              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}',
-              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}/items',
-              f'https://api.ticketing.cm.com/resell/v1.0/subscription/{SUB_ID}/availability',
-              f'https://api.ticketing.cm.com/resell/v1.0/public/subscription/{SUB_ID}/offers',
-              f'https://api.ticketing.cm.com/resell/v1.0/offers?subscriptionId={SUB_ID}',
-              f'https://api.ticketing.cm.com/resellapi/v1.0/subscription/{SUB_ID}/offers',
-              f'https://api.ticketing.cm.com/resellapi/v1.0/public/subscription/{SUB_ID}',
-              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/subscription/{SUB_ID}',
-              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/subscription/{SUB_ID}/availability',
-              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/event/subscription/{SUB_ID}/availability',
-              f'https://shop.ticketing.cm.com/api/resell/subscription/{SUB_ID}'
+          # 1. Probe known tenant/channel paths
+          candidate_urls = [
+              f'https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}',
+              f'https://api.ticketing.cm.com/resell/v1.0/public/dgpresell/subscription/{SUB_ID}/offers',
+              f'https://api.ticketing.cm.com/resell/v1.0/channel/dgpresell/subscription/{SUB_ID}',
+              f'https://api.ticketing.cm.com/resell/v1.0/public/event/{SUB_ID}',
+              f'https://api.ticketing.cm.com/resell/v1.0/dgpresell/subscription/{SUB_ID}',
+              f'https://api.ticketing.cm.com/resell/v1.0/public/channel/dgpresell/offers',
+              f'https://api.ticketing.cm.com/seatedapi/v1.0/public/venue/{VENUE_ID}/resell/offers'
           ]
 
+          # 2. Inspect frontend scripts from the shop page
+          print('--> Scanning frontend app bundle for live API routes...')
+          try:
+              html_res = requests.get(SHOP_URL, headers=req_headers, timeout=10)
+              scripts = re.findall(r'<script[^>]+src=[\"\\\']([^\"\\\']+\.js)[\"\\\']', html_res.text)
+              for s in scripts:
+                  js_url = urljoin(SHOP_URL, s)
+                  js_res = requests.get(js_url, headers=req_headers, timeout=10)
+                  # Find all API routes in the JS source
+                  endpoints = re.findall(r'[\"\\\'](/(?:resell|seatedapi|shop|subscription)/v[0-9.]*/[^\"\\\']+)[\"\\\']', js_res.text)
+                  for ep in endpoints:
+                      full_ep = f'https://api.ticketing.cm.com{ep}'.replace('{subscriptionId}', SUB_ID).replace('{id}', SUB_ID).replace('{channel}', 'dgpresell').replace('{venueId}', VENUE_ID)
+                      if full_ep not in candidate_urls:
+                          candidate_urls.append(full_ep)
+          except Exception as scan_err:
+              print(f'Frontend scan note: {scan_err}')
+
+          print(f'--> Discovered {len(candidate_urls)} target endpoints to test.\n')
+
           keywords = ['general admission', 'staanplaats', 'staanplaatsen', 'ga 1', 'ga 2', 'grandstand', 'vrijdag', 'friday', 'tribune', 'tarzan', 'arena', 'eastside', 'pit']
+          found_live_api = False
 
-          found_working_api = False
-
-          for url in endpoints_to_probe:
+          for url in candidate_urls:
               try:
-                  res = requests.get(url, headers=headers, timeout=5)
-                  print(f'Testing: {url} --> Status: {res.status_code}')
+                  res = requests.get(url, headers=req_headers, timeout=5)
+                  content_type = res.headers.get('Content-Type', '')
                   
-                  if res.status_code == 200:
-                      found_working_api = True
-                      print(f'\n🎯 SUCCESSFUL ENDPOINT FOUND:\n{url}\n')
-                      try:
-                          data = res.json()
-                          print('RESPONSE DATA SAMPLE:')
-                          print(json.dumps(data, indent=2)[:1500])
-                          
-                          # Search response for ticket matches
-                          data_str = json.dumps(data).lower()
-                          matched_kws = [kw for kw in keywords if kw in data_str]
-                          
-                          if matched_kws:
-                              print(f'\n⚡ MATCH FOUND FOR KEYWORDS: {matched_kws}')
-                              msg = f'🏎️ 🎟️ <b>DUTCH GP TICKETS DETECTED!</b>\n\n<b>Keywords matched:</b> {matched_kws}\n\n<b>Buy Now:</b> {SHOP_URL}'
-                              requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
-                              print('Telegram alert sent successfully!')
-                      except Exception as parse_err:
-                          print(f'Could not parse JSON: {parse_err}')
-                      break
-              except Exception as e:
-                  print(f'Failed connecting to {url}: {e}')
+                  # Must be 200 OK and valid JSON (not HTML fallback)
+                  if res.status_code == 200 and 'application/json' in content_type:
+                      data = res.json()
+                      found_live_api = True
+                      print(f'🎯 ACTIVE JSON ENDPOINT: {url}\n')
+                      print(f'DATA SAMPLE: {json.dumps(data, indent=2)[:800]}\n')
 
-          if not found_working_api:
-              print('\nNone of the direct endpoints returned 200 OK.')
+                      data_str = json.dumps(data).lower()
+                      matched = [k for k in keywords if k in data_str]
+
+                      if matched:
+                          print(f'⚡ TICKET INVENTORY FOUND! Matched: {matched}')
+                          msg = f'🏎️ 🎟️ <b>DUTCH GP RESALE TICKETS AVAILABLE!</b>\n\n<b>Categories:</b> {matched}\n\n<b>Buy Now:</b> {SHOP_URL}'
+                          requests.post(f'https://api.telegram.org/bot{token}/sendMessage', json={'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'})
+                          print('Telegram alert successfully sent!')
+                      else:
+                          print('Checked: Store currently has 0 inventory for target tickets.')
+                      break
+                  else:
+                      print(f'Skipping: {url} (Status {res.status_code}, Type: {content_type.split(\";\")[0]})')
+              except Exception as e:
+                  continue
+
+          if not found_live_api:
+              print('Finished scan cycle: No open inventory or endpoint mismatch.')
           "
