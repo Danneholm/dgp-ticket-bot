@@ -1,14 +1,15 @@
-name: Check Dutch GP Tickets
+name: Check 112 Amsterdam Zuid (Gelderlandplein)
 
 on:
   push:
     branches: [ main ]
   schedule:
+    # Runs every 5 minutes
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
-  check-tickets:
+  check-112:
     runs-on: ubuntu-latest
     steps:
       - name: Set up Python
@@ -16,103 +17,150 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install Playwright & Requests
-        run: |
-          pip install playwright requests
-          playwright install --with-deps chromium
+      - name: Install Requests
+        run: pip install requests
 
-      - name: Run Ticket Checker
+      - name: Run 112 Monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           cat << 'EOF' > check.py
           import os
-          import json
+          import re
+          import math
           import requests
-          from playwright.sync_api import sync_playwright
+          import email.utils
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
 
-          SHOP_URL = "https://shop.ticketing.cm.com/dgpresell/resell/subscription/01612d62-d8f4-4f04-a706-44c5ec27fc96"
+          # Coordinates: Gelderlandplein, Amsterdam Zuid
+          GELDERLANDPLEIN_LAT = 52.3278
+          GELDERLANDPLEIN_LON = 4.8765
+          MAX_RADIUS_KM = 1.0
+
+          # P2000 live feed for Amsterdam & Amstelveen
+          FEED_URL = "https://alarmeringen.nl/feeds/region/amsterdam-amstelland.rss"
+
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-          keywords = [
-              "general admission", "staanplaats", "staanplaatsen",
-              "ga 1", "ga 2", "general admission 1"
-          ]
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+              "Accept": "application/rss+xml, application/xml, text/xml; q=0.1"
+          }
 
-          print(f"🚀 Launching headless browser to inspect: {SHOP_URL}")
+          def haversine(lat1, lon1, lat2, lon2):
+              R = 6371.0  # Earth radius in km
+              dlat = math.radians(lat2 - lat1)
+              dlon = math.radians(lon2 - lon1)
+              a = (math.sin(dlat / 2) ** 2 +
+                   math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+                   math.sin(dlon / 2) ** 2)
+              c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+              return R * c
 
-          captured_apis = []
+          try:
+              print(f"📡 Fetching live 112 feed: {FEED_URL}")
+              res = requests.get(FEED_URL, headers=headers, timeout=10)
+              if res.status_code != 200:
+                  print(f"Failed to fetch feed: HTTP {res.status_code}")
+                  exit(0)
 
-          with sync_playwright() as p:
-              browser = p.chromium.launch(headless=True)
-              context = browser.new_context(
-                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-              )
-              page = context.new_page()
+              root = ET.fromstring(res.content)
+              items = root.findall(".//item")
+              print(f"Retrieved {len(items)} recent regional 112 calls.")
 
-              # Intercept all internal XHR/Fetch API calls the shop makes
-              def on_response(response):
-                  req = response.request
-                  if req.resource_type in ["xhr", "fetch"]:
+              now_dt = datetime.now(timezone.utc)
+              matched_incidents = 0
+
+              for item in items:
+                  title = item.findtext("title", "")
+                  link = item.findtext("link", "")
+                  description = item.findtext("description", "")
+                  pub_date_str = item.findtext("pubDate", "")
+
+                  # Check incident age (only alert for events in the last 6 minutes)
+                  age_sec = None
+                  if pub_date_str:
                       try:
-                          text = response.text()
-                          print(f"\n📡 [NETWORK XHR] {response.status} {response.url}")
-                          print(f"Payload Preview: {text[:350]}")
-                          captured_apis.append((response.url, text))
+                          pub_dt = email.utils.parsedate_to_datetime(pub_date_str)
+                          age_sec = (now_dt - pub_dt).total_seconds()
                       except Exception:
                           pass
 
-              page.on("response", on_response)
+                  # Extract Geo coordinates from item XML
+                  raw_xml = ET.tostring(item, encoding="utf-8").decode("utf-8")
+                  lat_match = re.search(r'<geo:lat>([0-9.]+)</geo:lat>', raw_xml)
+                  lon_match = re.search(r'<geo:(?:long|lon)>([0-9.]+)</geo:(?:long|lon)>', raw_xml)
+                  point_match = re.search(r'<georss:point>([0-9.]+)\s+([0-9.]+)</georss:point>', raw_xml)
 
-              try:
-                  page.goto(SHOP_URL, wait_until="networkidle", timeout=30000)
-              except Exception as e:
-                  print(f"Page load notice: {e}")
+                  lat, lon = None, None
+                  if lat_match and lon_match:
+                      lat, lon = float(lat_match.group(1)), float(lon_match.group(1))
+                  elif point_match:
+                      lat, lon = float(point_match.group(1)), float(point_match.group(2))
 
-              # Brief pause for dynamic Angular rendering
-              page.wait_for_timeout(3000)
+                  # Fallback for key streets right by Gelderlandplein if geo tags are omitted
+                  local_street_keywords = [
+                      "gelderlandplein", "van leijenberghlaan", "a.j. ernststraat", 
+                      "arent janszoon ernststraat", "willem van weldammelaan", 
+                      "loevestein", "kastelenstraat", "buitenveldert"
+                  ]
 
-              # 1. Inspect rendered DOM text
-              page_text = page.inner_text("body").lower()
-              print(f"\n📄 RENDERED PAGE PREVIEW:\n{page_text[:400]}\n")
+                  dist_km = None
+                  is_match = False
 
-              matched_in_page = [kw for kw in keywords if kw in page_text]
+                  if lat and lon:
+                      dist_km = haversine(GELDERLANDPLEIN_LAT, GELDERLANDPLEIN_LON, lat, lon)
+                      if dist_km <= MAX_RADIUS_KM:
+                          is_match = True
+                  elif any(kw in (title + " " + description).lower() for kw in local_street_keywords):
+                      is_match = True
+                      dist_km = 0.5  # Estimated center
 
-              # 2. Inspect captured API payloads
-              matched_in_api = []
-              for url, payload in captured_apis:
-                  p_lower = payload.lower()
-                  # Exclude static venue layout endpoints
-                  if "seatedapi" not in url:
-                      for kw in keywords:
-                          if kw in p_lower and kw not in matched_in_api:
-                              matched_in_api.append(kw)
+                  if is_match:
+                      # If age is known and older than 6 minutes, skip to avoid repeat alerts
+                      if age_sec is not None and age_sec > 360:
+                          print(f"Skipping older match ({int(age_sec/60)}m ago): {title}")
+                          continue
 
-              matches = list(set(matched_in_page + matched_in_api))
-              print(f"🔎 Keyword matches found: {matches}")
+                      matched_incidents += 1
+                      
+                      # Service detection emoji
+                      emoji = "🚨"
+                      text_lower = (title + " " + description).lower()
+                      if "ambu" in text_lower or "cpa" in text_lower:
+                          emoji = "🚑"
+                      elif "brw" in text_lower or "brand" in text_lower or "tankautospuit" in text_lower:
+                          emoji = "🚒"
+                      elif "pol" in text_lower or "politie" in text_lower:
+                          emoji = "🚓"
 
-              # Verify against purchase / ticket indicators
-              has_ticket_indicators = any(ind in page_text for ind in ["ticket", "kaart", "€", "available", "beschikbaar", "bestel", "selecteer"])
+                      dist_str = f"{int(dist_km * 1000)}m" if dist_km else "< 1km"
+                      print(f"\n{emoji} ALERT DETECTED ({dist_str} away): {title}")
 
-              if matches and has_ticket_indicators:
-                  print(f"⚡ TICKETS DETECTED! Alerting Telegram for: {matches}")
-                  msg = (
-                      f"🏎️ 🎟️ <b>DUTCH GP RESALE TICKETS AVAILABLE!</b>\n\n"
-                      f"<b>Matched Categories:</b> {', '.join(matches)}\n\n"
-                      f"<b>Buy Now:</b> {SHOP_URL}"
-                  )
-                  if token and chat_id:
-                      res = requests.post(
-                          f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
+                      msg = (
+                          f"{emoji} <b>112 MELDING IN DE BUURT</b>\n\n"
+                          f"📍 <b>Afstand:</b> ~{dist_str} van Gelderlandplein\n"
+                          f"📋 <b>Melding:</b> {title}\n"
                       )
-                      print(f"Telegram response: {res.status_code}")
-              else:
-                  print("✅ Check complete: No active resale inventory currently matching.")
+                      if description and description != title:
+                          msg += f"ℹ️ <b>Details:</b> {description}\n"
+                      if link:
+                          msg += f"\n🔗 <a href='{link}'>Bekijk incident details</a>"
 
-              browser.close()
+                      requests.post(
+                          f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
+                      )
+                      print("Telegram alert delivered!")
+
+              if matched_incidents == 0:
+                  print("✅ Scan complete: 0 incidents within 1km of Gelderlandplein in the last 5 minutes.")
+
+          except Exception as e:
+              print(f"Error during check: {e}")
           EOF
 
           python check.py
