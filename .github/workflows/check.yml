@@ -42,8 +42,10 @@ jobs:
           GELDERLANDPLEIN_LON = 4.8765
           MAX_RADIUS_KM = 1.0
 
-          BASE_URL = "https://alarmeringen.nl"
-          FEED_URL = "https://alarmeringen.nl/feeds/region/amsterdam-amstelland.rss"
+          FEED_URLS = [
+              "https://alarmeringen.nl/feeds/region/amsterdam-amstelland.rss",
+              "https://alarmeringen.nl/feeds/city/amsterdam.rss"
+          ]
 
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -58,42 +60,77 @@ jobs:
               c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
               return R * c
 
-          print("🚀 Launching browser to bypass Cloudflare protection...")
+          print("🚀 Launching browser to retrieve live 112 feed...")
           xml_raw = None
 
           with sync_playwright() as p:
-              browser = p.chromium.launch(headless=True)
+              browser = p.chromium.launch(
+                  headless=True,
+                  args=[
+                      "--disable-blink-features=AutomationControlled",
+                      "--no-sandbox",
+                      "--disable-setuid-sandbox"
+                  ]
+              )
               context = browser.new_context(
-                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                  user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                  locale="nl-NL",
+                  timezone_id="Europe/Amsterdam"
               )
               page = context.new_page()
+              page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-              try:
-                  # Visit the base site to clear Cloudflare checks and obtain session tokens
-                  page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
-                  page.wait_for_timeout(2000)
+              for feed_url in FEED_URLS:
+                  try:
+                      print(f"📡 Loading feed: {feed_url}")
+                      resp = page.goto(feed_url, wait_until="domcontentloaded", timeout=25000)
 
-                  # Fetch the RSS feed from inside the authenticated browser context
-                  xml_raw = page.evaluate("""async (url) => {
-                      const resp = await fetch(url);
-                      return await resp.text();
-                  }""", FEED_URL)
-              except Exception as err:
-                  print(f"Browser navigation error: {err}")
-              finally:
-                  browser.close()
+                      if resp and resp.status == 403 or "Just a moment" in page.title():
+                          print("Cloudflare verification detected, waiting 4s...")
+                          page.wait_for_timeout(4000)
+
+                      # Retrieve raw HTTP payload directly from network response
+                      body_text = resp.text() if resp else ""
+                      if not body_text or "<rss" not in body_text:
+                          dom_text = page.content()
+                          if "<rss" in dom_text:
+                              body_text = dom_text
+                          elif "<rss" in page.inner_text("body"):
+                              body_text = page.inner_text("body")
+
+                      if body_text and ("<rss" in body_text or "<feed" in body_text):
+                          xml_raw = body_text
+                          print(f"✅ Successfully retrieved feed from {feed_url}")
+                          break
+                  except Exception as e:
+                      print(f"Notice loading {feed_url}: {e}")
+
+              browser.close()
 
           if not xml_raw or "<rss" not in xml_raw:
-              print(f"Could not retrieve valid RSS XML feed. Sample: {str(xml_raw)[:200]}")
+              print(f"Could not retrieve valid RSS XML feed. Raw snippet: {str(xml_raw)[:250]}")
               exit(0)
+
+          # Extract unescaped XML if browser rendered it inside a <pre> container
+          if "<pre" in xml_raw:
+              match = re.search(r'<pre[^>]*>(.*?)</pre>', xml_raw, re.DOTALL)
+              if match:
+                  xml_raw = match.group(1).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 
           try:
               root = ET.fromstring(xml_raw)
               items = root.findall(".//item")
-              print(f"📡 Successfully retrieved {len(items)} regional emergency calls.")
+              print(f"📋 Parsed {len(items)} regional 112 emergency calls.")
 
               now_dt = datetime.now(timezone.utc)
               matched_incidents = 0
+
+              local_street_keywords = [
+                  "gelderlandplein", "van leijenberghlaan", "a.j. ernststraat",
+                  "arent janszoon ernststraat", "willem van weldammelaan",
+                  "loevestein", "kastelenstraat", "de klencke", "buitenveldert",
+                  "buitenveldertselaan", "groenendaal", "asbrink", "dikninge"
+              ]
 
               for item in items:
                   title = item.findtext("title", "")
@@ -101,7 +138,7 @@ jobs:
                   description = item.findtext("description", "")
                   pub_date_str = item.findtext("pubDate", "")
 
-                  # Check incident age (only alert for calls in the last 6 minutes)
+                  # Deduplication: only process calls published in the last 6 minutes
                   age_sec = None
                   if pub_date_str:
                       try:
@@ -110,24 +147,17 @@ jobs:
                       except Exception:
                           pass
 
-                  # Extract Geo coordinates from item XML
-                  raw_item_xml = ET.tostring(item, encoding="utf-8").decode("utf-8")
-                  lat_match = re.search(r'<geo:lat>([0-9.]+)</geo:lat>', raw_item_xml)
-                  lon_match = re.search(r'<geo:(?:long|lon)>([0-9.]+)</geo:(?:long|lon)>', raw_item_xml)
-                  point_match = re.search(r'<georss:point>([0-9.]+)\s+([0-9.]+)</georss:point>', raw_item_xml)
+                  # Extract Geo coordinates
+                  raw_xml = ET.tostring(item, encoding="utf-8").decode("utf-8")
+                  lat_match = re.search(r'<geo:lat>([0-9.]+)</geo:lat>', raw_xml)
+                  lon_match = re.search(r'<geo:(?:long|lon)>([0-9.]+)</geo:(?:long|lon)>', raw_xml)
+                  point_match = re.search(r'<georss:point>([0-9.]+)\s+([0-9.]+)</georss:point>', raw_xml)
 
                   lat, lon = None, None
                   if lat_match and lon_match:
                       lat, lon = float(lat_match.group(1)), float(lon_match.group(1))
                   elif point_match:
                       lat, lon = float(point_match.group(1)), float(point_match.group(2))
-
-                  # Fallback street keywords directly surrounding Gelderlandplein
-                  local_street_keywords = [
-                      "gelderlandplein", "van leijenberghlaan", "a.j. ernststraat",
-                      "arent janszoon ernststraat", "willem van weldammelaan",
-                      "loevestein", "kastelenstraat", "de klencke", "buitenveldert"
-                  ]
 
                   dist_km = None
                   is_match = False
@@ -141,14 +171,13 @@ jobs:
                       dist_km = 0.5  # Approximate center distance
 
                   if is_match:
-                      # Skip older events so you don't get duplicate notifications
                       if age_sec is not None and age_sec > 360:
                           print(f"Skipping older match ({int(age_sec/60)}m ago): {title}")
                           continue
 
                       matched_incidents += 1
 
-                      # Assign emoji based on emergency service
+                      # Service categorization emoji
                       emoji = "🚨"
                       text_lower = (title + " " + description).lower()
                       if "ambu" in text_lower or "cpa" in text_lower:
