@@ -8,10 +8,16 @@ on:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   check-112:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -30,7 +36,9 @@ jobs:
           cat << 'EOF' > check.py
           import os
           import re
+          import json
           import math
+          import html
           import requests
           import email.utils
           import xml.etree.ElementTree as ET
@@ -47,6 +55,9 @@ jobs:
               "https://alarmeringen.nl/feeds/city/amsterdam.rss"
           ]
 
+          STATE_FILE = "seen_incidents.json"
+          STATE_MAX_AGE_SEC = 3600  # prune entries older than 1 hour
+
           token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
           chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -59,6 +70,24 @@ jobs:
                    math.sin(dlon / 2) ** 2)
               c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
               return R * c
+
+          def load_state():
+              if os.path.exists(STATE_FILE):
+                  try:
+                      with open(STATE_FILE, "r") as f:
+                          return json.load(f)
+                  except Exception:
+                      return {}
+              return {}
+
+          def save_state(state, now_ts):
+              # prune old entries so the file doesn't grow forever
+              pruned = {k: v for k, v in state.items() if now_ts - v <= STATE_MAX_AGE_SEC}
+              with open(STATE_FILE, "w") as f:
+                  json.dump(pruned, f)
+
+          seen = load_state()
+          now_ts = datetime.now(timezone.utc).timestamp()
 
           print("🚀 Launching browser to retrieve live 112 feed...")
           xml_raw = None
@@ -138,7 +167,13 @@ jobs:
                   description = item.findtext("description", "")
                   pub_date_str = item.findtext("pubDate", "")
 
-                  # Deduplication: only process calls published in the last 6 minutes
+                  # Unique key for dedup: prefer link, fall back to title+pubDate
+                  incident_key = link.strip() if link else f"{title.strip()}|{pub_date_str.strip()}"
+
+                  if incident_key in seen:
+                      continue
+
+                  # Deduplication by recency: only process calls published in the last 6 minutes
                   age_sec = None
                   if pub_date_str:
                       try:
@@ -173,6 +208,7 @@ jobs:
                   if is_match:
                       if age_sec is not None and age_sec > 360:
                           print(f"Skipping older match ({int(age_sec/60)}m ago): {title}")
+                          seen[incident_key] = now_ts
                           continue
 
                       matched_incidents += 1
@@ -190,27 +226,51 @@ jobs:
                       dist_str = f"{int(dist_km * 1000)}m" if dist_km else "< 1km"
                       print(f"\n{emoji} ALERT DETECTED ({dist_str} away): {title}")
 
+                      safe_title = html.escape(title)
+                      safe_description = html.escape(description)
+
                       msg = (
                           f"{emoji} <b>112 MELDING IN DE BUURT</b>\n\n"
                           f"📍 <b>Afstand:</b> ~{dist_str} van Gelderlandplein\n"
-                          f"📋 <b>Melding:</b> {title}\n"
+                          f"📋 <b>Melding:</b> {safe_title}\n"
                       )
                       if description and description != title:
-                          msg += f"ℹ️ <b>Details:</b> {description}\n"
+                          msg += f"ℹ️ <b>Details:</b> {safe_description}\n"
                       if link:
-                          msg += f"\n🔗 <a href='{link}'>Bekijk incident details</a>"
+                          msg += f"\n🔗 <a href='{html.escape(link)}'>Bekijk incident details</a>"
 
-                      requests.post(
+                      tg_resp = requests.post(
                           f"https://api.telegram.org/bot{token}/sendMessage",
                           json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
                       )
-                      print("Telegram alert delivered successfully!")
+                      if tg_resp.ok:
+                          print("Telegram alert delivered successfully!")
+                          seen[incident_key] = now_ts
+                      else:
+                          print(f"⚠️ Telegram send failed ({tg_resp.status_code}): {tg_resp.text}")
+                  else:
+                      # not a local match, no need to keep re-checking it every run
+                      seen[incident_key] = now_ts
 
               if matched_incidents == 0:
-                  print("✅ Scan complete: 0 incidents within 1km of Gelderlandplein in the last 5 minutes.")
+                  print("✅ Scan complete: 0 new incidents within 1km of Gelderlandplein in the last 5 minutes.")
 
           except Exception as parse_err:
               print(f"Error parsing feed items: {parse_err}")
+
+          save_state(seen, now_ts)
           EOF
 
           python check.py
+
+      - name: Commit updated state file
+        run: |
+          if [[ -n "$(git status --porcelain seen_incidents.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add seen_incidents.json
+            git commit -m "Update seen incidents state [skip ci]"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
